@@ -1,0 +1,18 @@
+[package]
+name = "runpod-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yutaka Nishimura"]
+description = "RunPod CLI — auto-generated from OpenAPI spec"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/runpod-cli"
+keywords = ["runpod", "cli", "openapi", "serverless", "gpu"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[dependencies]
+openapi-clap = "0.1.5"
+openapi-deref = "0.1"
+serde_json = "1"
+anyhow = "1"
+urlencoding = "2"
