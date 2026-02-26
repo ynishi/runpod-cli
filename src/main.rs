@@ -1,3 +1,4 @@
+mod exec;
 mod request;
 mod serverless;
 
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         DEFAULT_BASE_URL,
     );
     let cmd = build_commands(&config, &operations)
+        .subcommand(exec::build_command())
         .subcommand(serverless::build_command())
         .arg(
             Arg::new("output")
@@ -90,7 +92,11 @@ fn main() -> Result<()> {
 
     let client = Client::new();
 
-    let result = if group_name == "serverless" {
+    let result = if group_name == "exec" {
+        // SSH exec (non-interactive command execution on pod)
+        exec::dispatch(&client, &api_key, base_url, group_matches)?;
+        None
+    } else if group_name == "serverless" {
         // Serverless job API (custom commands)
         let (sub_name, sub_matches) = group_matches
             .subcommand()
