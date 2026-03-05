@@ -332,9 +332,48 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Validate that a job ID is a hex string (as produced by `generate_job_id`).
+///
+/// Rejects values containing path separators, whitespace, or non-hex characters
+/// to prevent path traversal when constructing task/download directory paths.
+pub fn validate_job_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 16 && id.chars().all(|c| c.is_ascii_hexdigit()),
+        "invalid job ID: expected hex string, got {id:?}"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_job_id ──
+
+    #[test]
+    fn valid_job_id_accepted() {
+        assert!(validate_job_id("abcdef012345").is_ok());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_job_id("../../etc").is_err());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_job_id("").is_err());
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        assert!(validate_job_id("hello world!").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        assert!(validate_job_id("abcdef0123456789a").is_err());
+    }
 
     // ── extract_ssh_port ──
 

@@ -165,6 +165,7 @@ fn dispatch_status(
     let job_id = matches
         .get_one::<String>("job_id")
         .context("job_id is required")?;
+    ssh::validate_job_id(job_id)?;
 
     let quoted_dl_dir = ssh::shell_quote(&format!("{DL_BASE_DIR}/{job_id}"));
 

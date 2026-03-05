@@ -3,6 +3,7 @@ mod exec;
 mod request;
 mod serverless;
 mod ssh;
+mod task;
 
 use anyhow::{Context, Result};
 use openapi_clap::clap::{Arg, ArgAction};
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
     let cmd = build_commands(&config, &operations)
         .subcommand(exec::build_command())
         .subcommand(download::build_command())
+        .subcommand(task::build_command())
         .subcommand(serverless::build_command())
         .arg(
             Arg::new("output")
@@ -102,6 +104,9 @@ fn main() -> Result<()> {
     } else if group_name == "download" {
         // Background download management on pod
         download::dispatch(&client, &api_key, base_url, group_matches)?
+    } else if group_name == "task" {
+        // Background task execution on pod
+        task::dispatch(&client, &api_key, base_url, group_matches)?
     } else if group_name == "serverless" {
         // Serverless job API (custom commands)
         let (sub_name, sub_matches) = group_matches
