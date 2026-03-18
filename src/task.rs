@@ -21,14 +21,24 @@ pub fn build_command() -> Command {
         )
         .subcommand_required(true)
         .subcommand(
-            ssh::add_ssh_args(Command::new("run").about("Start a background task on a pod")).arg(
-                Arg::new("command")
-                    .allow_hyphen_values(true)
-                    .required(true)
-                    .num_args(1..)
-                    .last(true)
-                    .help("Command to execute in background"),
-            ),
+            ssh::add_ssh_args(Command::new("run").about("Start a background task on a pod"))
+                .arg(
+                    Arg::new("command")
+                        .allow_hyphen_values(true)
+                        .num_args(1..)
+                        .last(true)
+                        .help("Command to execute in background"),
+                )
+                .arg(Arg::new("script").long("script").value_name("FILE").help(
+                    "Path to a local script file to upload and execute. \
+                             The file is SCP'd to the pod and run via `sh`. \
+                             Mutually exclusive with -- <command>.",
+                ))
+                .group(
+                    openapi_clap::clap::ArgGroup::new("execution")
+                        .args(["command", "script"])
+                        .required(true),
+                ),
         )
         .subcommand(
             ssh::add_ssh_args(Command::new("status").about("Check task status")).arg(
@@ -85,6 +95,13 @@ fn dispatch_run(
 ) -> Result<Option<serde_json::Value>> {
     let target = ssh::resolve_target(client, api_key, base_url, matches)?;
 
+    // Determine execution mode: --script or -- <command>
+    let script_file = matches.get_one::<String>("script");
+
+    if let Some(script_path) = script_file {
+        return dispatch_run_script(&target, script_path);
+    }
+
     let command_parts: Vec<&str> = matches
         .get_many::<String>("command")
         .context("command is required")?
@@ -100,11 +117,11 @@ fn dispatch_run(
         r#"set -e
 TASK_DIR={quoted_task_dir}
 mkdir -p "$TASK_DIR"
+printf '%s\n' {quoted_cmd} > "$TASK_DIR/run.sh"
 printf '%s\n' {quoted_cmd} > "$TASK_DIR/cmd"
 date +%s > "$TASK_DIR/started"
 nohup sh -c '
-  CMD=$(cat "$0/cmd")
-  eval "$CMD" >"$0/log" 2>&1
+  sh "$0/run.sh" >"$0/log" 2>&1
   echo $? > "$0/exit"
 ' "$TASK_DIR" >/dev/null 2>&1 &
 echo $! > "$TASK_DIR/pid"
@@ -126,6 +143,69 @@ echo "OK""#
     Ok(Some(serde_json::json!({
         "id": job_id,
         "command": command,
+    })))
+}
+
+/// Script-file execution mode: SCP the script to the pod, then run it as a background task.
+///
+/// Flow:
+/// 1. Generate job_id from script content hash
+/// 2. SCP local file → `/tmp/runpod-task/{job_id}/script.sh`
+/// 3. Background-execute via nohup: `sh script.sh > log 2>&1`
+/// 4. Return job_id for status/log polling
+fn dispatch_run_script(
+    target: &ssh::SshTarget,
+    local_script_path: &str,
+) -> Result<Option<serde_json::Value>> {
+    let local_path = std::path::Path::new(local_script_path);
+    if !local_path.exists() {
+        bail!("script file not found: {local_script_path}");
+    }
+
+    let content = std::fs::read_to_string(local_path)
+        .with_context(|| format!("failed to read script: {local_script_path}"))?;
+
+    let job_id = generate_job_id(&content);
+    let task_dir = format!("{TASK_BASE_DIR}/{job_id}");
+    let remote_script = format!("{task_dir}/run.sh");
+
+    let quoted_task_dir = ssh::shell_quote(&task_dir);
+    let quoted_cmd = ssh::shell_quote(&format!("script: {local_script_path}"));
+
+    // The bootstrap command runs after SCP upload completes.
+    // It records metadata and starts the script in background.
+    let bootstrap = format!(
+        r#"set -e
+TASK_DIR={quoted_task_dir}
+mkdir -p "$TASK_DIR"
+printf '%s\n' {quoted_cmd} > "$TASK_DIR/cmd"
+date +%s > "$TASK_DIR/started"
+nohup sh -c '
+  sh "$0/run.sh" >"$0/log" 2>&1
+  echo $? > "$0/exit"
+' "$TASK_DIR" >/dev/null 2>&1 &
+echo $! > "$TASK_DIR/pid"
+echo "OK""#
+    );
+
+    let (stdout, stderr, exit_code) =
+        ssh::ssh_upload_and_exec(target, local_path, &remote_script, &bootstrap)?;
+
+    if exit_code != 0 {
+        bail!(
+            "failed to start script task (exit {exit_code}): {}",
+            stderr.trim()
+        );
+    }
+
+    let stdout = stdout.trim();
+    if stdout != "OK" {
+        bail!("unexpected response from pod: {stdout}");
+    }
+
+    Ok(Some(serde_json::json!({
+        "id": job_id,
+        "command": format!("script: {local_script_path}"),
     })))
 }
 
@@ -525,6 +605,57 @@ LOG_END
             sub.get_one::<String>("lines").map(|s| s.as_str()),
             Some("50")
         );
+    }
+
+    #[test]
+    fn run_script_parses() {
+        let cmd = build_command();
+        let m = cmd.try_get_matches_from(["task", "run", "--script", "/tmp/inspect.sh", "pod1"]);
+        assert!(m.is_ok(), "run --script should parse: {m:?}");
+        let binding = m.unwrap();
+        let (_, sub) = binding.subcommand().unwrap();
+        assert_eq!(
+            sub.get_one::<String>("script").map(|s| s.as_str()),
+            Some("/tmp/inspect.sh")
+        );
+    }
+
+    #[test]
+    fn run_script_with_ssh_args() {
+        let cmd = build_command();
+        let m = cmd.try_get_matches_from([
+            "task",
+            "run",
+            "-i",
+            "/tmp/key",
+            "--script",
+            "/tmp/test.sh",
+            "pod1",
+        ]);
+        assert!(m.is_ok(), "run --script with SSH args should parse: {m:?}");
+    }
+
+    #[test]
+    fn run_rejects_both_script_and_command() {
+        let cmd = build_command();
+        let m = cmd.try_get_matches_from([
+            "task",
+            "run",
+            "--script",
+            "/tmp/test.sh",
+            "pod1",
+            "--",
+            "echo",
+            "hello",
+        ]);
+        assert!(m.is_err(), "should reject both --script and -- command");
+    }
+
+    #[test]
+    fn run_requires_script_or_command() {
+        let cmd = build_command();
+        let m = cmd.try_get_matches_from(["task", "run", "pod1"]);
+        assert!(m.is_err(), "should require either --script or -- command");
     }
 
     #[test]

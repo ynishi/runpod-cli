@@ -1,6 +1,6 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -127,8 +127,8 @@ pub fn resolve_target(
 
 // ── SSH execution ──
 
-/// Execute a command on a remote host via SSH exec channel (no PTY).
-pub fn ssh_exec(target: &SshTarget, command: &str) -> Result<(String, String, i32)> {
+/// Establish an authenticated SSH session.
+fn ssh_connect(target: &SshTarget) -> Result<Session> {
     let addr: SocketAddr = format!("{}:{}", target.host, target.port)
         .parse()
         .with_context(|| format!("invalid address: {}:{}", target.host, target.port))?;
@@ -140,7 +140,6 @@ pub fn ssh_exec(target: &SshTarget, command: &str) -> Result<(String, String, i3
     session.set_tcp_stream(tcp);
     session.handshake().context("SSH handshake failed")?;
 
-    // Key-based auth
     if !target.key_path.exists() {
         bail!(
             "SSH key not found: {}. Use -i to specify key path.",
@@ -161,7 +160,11 @@ pub fn ssh_exec(target: &SshTarget, command: &str) -> Result<(String, String, i3
         bail!("SSH authentication failed");
     }
 
-    // Exec channel (no PTY)
+    Ok(session)
+}
+
+/// Execute a command on a remote host via SSH exec channel and collect output.
+fn session_exec(session: &Session, command: &str) -> Result<(String, String, i32)> {
     let mut channel = session
         .channel_session()
         .context("failed to open SSH channel")?;
@@ -186,6 +189,52 @@ pub fn ssh_exec(target: &SshTarget, command: &str) -> Result<(String, String, i3
     let exit_code = channel.exit_status().context("failed to get exit status")?;
 
     Ok((stdout, stderr, exit_code))
+}
+
+/// Execute a command on a remote host via SSH exec channel (no PTY).
+pub fn ssh_exec(target: &SshTarget, command: &str) -> Result<(String, String, i32)> {
+    let session = ssh_connect(target)?;
+    session_exec(&session, command)
+}
+
+/// Upload a local file to the remote host via SCP, then execute a command.
+///
+/// Uses a single SSH session for both operations. The file is transferred
+/// first, then the command is executed on the same connection.
+pub fn ssh_upload_and_exec(
+    target: &SshTarget,
+    local_path: &Path,
+    remote_path: &str,
+    command: &str,
+) -> Result<(String, String, i32)> {
+    let session = ssh_connect(target)?;
+
+    // Read local file
+    let content = std::fs::read(local_path)
+        .with_context(|| format!("failed to read {}", local_path.display()))?;
+
+    // Ensure remote parent directory exists
+    let remote_dir = remote_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("/tmp");
+    session_exec(&session, &format!("mkdir -p {}", shell_quote(remote_dir)))?;
+
+    // SCP send
+    let mut channel = session
+        .scp_send(Path::new(remote_path), 0o755, content.len() as u64, None)
+        .with_context(|| format!("failed to initiate SCP to {remote_path}"))?;
+    channel
+        .write_all(&content)
+        .with_context(|| format!("failed to write to {remote_path}"))?;
+    channel.send_eof().context("failed to send SCP EOF")?;
+    channel.wait_eof().context("failed to wait SCP EOF")?;
+    channel
+        .wait_close()
+        .context("failed to close SCP channel")?;
+
+    // Execute command
+    session_exec(&session, command)
 }
 
 // ── Connection resolution ──
